@@ -24,6 +24,7 @@ from match_objects import (
     LinearTransform,
     Object,
     annotation_folders,
+    camera_layout_match,
     calibration_key,
     count_intersections,
     image_files,
@@ -33,7 +34,6 @@ from match_objects import (
     render_bmp,
     save_matched_crops,
     svg_visualization,
-    transform_guided_match,
 )
 
 
@@ -51,6 +51,34 @@ RED = "#D84A4A"
 CANVAS_BG = "#0E1720"
 
 HEX_COLORS = ["#%02x%02x%02x" % color for color in MATCH_COLORS]
+DATASET_METADATA_FILENAME = "match_editor.metadata.json"
+
+
+def save_dataset_camera_count(dataset: Path, camera_count: int) -> None:
+    """Persist editor settings that apply to every image in a dataset."""
+    if camera_count not in (2, 4):
+        raise ValueError("camera_count must be 2 or 4")
+    metadata = {
+        "version": 1,
+        "camera_count": camera_count,
+    }
+    path = dataset / DATASET_METADATA_FILENAME
+    path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+
+def load_dataset_camera_count(dataset: Path) -> int:
+    """Load a dataset's camera layout, creating 2-camera metadata if needed."""
+    path = dataset / DATASET_METADATA_FILENAME
+    try:
+        metadata = json.loads(path.read_text(encoding="utf-8-sig"))
+        camera_count = metadata.get("camera_count")
+        if type(camera_count) is int and camera_count in (2, 4):
+            return camera_count
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+
+    save_dataset_camera_count(dataset, 2)
+    return 2
 
 
 def read_bmp_rows(path: Path) -> tuple[int, int, list[bytes]]:
@@ -79,9 +107,18 @@ def read_bmp_rows(path: Path) -> tuple[int, int, list[bytes]]:
 
 
 def scaled_photo(
-    rows: list[bytes], width: int, height: int, max_width: int, max_height: int
+    rows: list[bytes],
+    width: int,
+    height: int,
+    max_width: int,
+    max_height: int,
+    max_scale: float = 1.0,
 ) -> tuple[tk.PhotoImage, float]:
-    scale = min(max_width / max(width, 1), max_height / max(height, 1), 1.0)
+    scale = min(
+        max_width / max(width, 1),
+        max_height / max(height, 1),
+        max_scale,
+    )
     out_width = max(1, int(width * scale))
     out_height = max(1, int(height * scale))
     pixels = bytearray(out_width * out_height * 3)
@@ -97,9 +134,18 @@ def scaled_photo(
 
 
 class MatchDocument:
-    def __init__(self, dataset: Path, image_path: Path, merge_iou: float = 0.5):
+    def __init__(
+        self,
+        dataset: Path,
+        image_path: Path,
+        merge_iou: float = 0.5,
+        camera_count: int = 2,
+    ):
+        if camera_count not in (2, 4):
+            raise ValueError("camera_count must be 2 or 4")
         self.dataset = dataset
         self.image_path = image_path
+        self.camera_count = camera_count
         (
             _,
             self.annotation_paths,
@@ -130,17 +176,26 @@ class MatchDocument:
                 self.transform = LinearTransform(**{key: values[key] for key in allowed if key in values})
             except (OSError, ValueError, TypeError):
                 saved = None
-        self.automatic_pairs = transform_guided_match(
-            self.top, self.bottom, self.width, self.transform
+        self.automatic_pairs = camera_layout_match(
+            self.top,
+            self.bottom,
+            self.width,
+            self.transform,
+            self.camera_count,
         )
         top_by_id = {item.id: item for item in self.top}
         bottom_by_id = {item.id: item for item in self.bottom}
         loaded: list[tuple[Object, Object]] = []
-        if saved:
+        saved_camera_count = saved.get("camera_count", 2) if saved else 2
+        if saved and saved_camera_count == self.camera_count:
             for match in saved.get("matches", []):
                 top_item = top_by_id.get(match.get("top", {}).get("id"))
                 bottom_item = bottom_by_id.get(match.get("bottom", {}).get("id"))
-                if top_item is not None and bottom_item is not None:
+                if (
+                    top_item is not None
+                    and bottom_item is not None
+                    and self.same_column(top_item, bottom_item)
+                ):
                     loaded.append((top_item, bottom_item))
         self.pairs = loaded or list(self.automatic_pairs)
         self._sort()
@@ -166,7 +221,15 @@ class MatchDocument:
     def _sort(self) -> None:
         self.pairs.sort(key=lambda pair: (pair[0].center_x, pair[0].center_y))
 
+    def same_column(self, top: Object, bottom: Object) -> bool:
+        if self.camera_count == 2:
+            return True
+        split_x = self.width / 2.0
+        return (top.center_x >= split_x) == (bottom.center_x >= split_x)
+
     def pair(self, top: Object, bottom: Object) -> bool:
+        if not self.same_column(top, bottom):
+            return False
         if any(a.id == top.id and b.id == bottom.id for a, b in self.pairs):
             return False
         self._checkpoint()
@@ -239,7 +302,9 @@ class MatchDocument:
             "image": self.image_path.name,
             "width": self.width,
             "height": self.height,
+            "camera_count": self.camera_count,
             "split_y": self.height / 2,
+            "split_x": self.width / 2 if self.camera_count == 4 else None,
             "annotation_sources": [str(path) for path in self.annotation_paths],
             "calibration_key": calibration_key(self.image_path, self.width, self.height),
             "linear_transform": asdict(self.transform),
@@ -326,6 +391,11 @@ class MatchEditor(tk.Tk):
         self.preview_photo: tk.PhotoImage | None = None
         self.image_scale = 1.0
         self.image_origin = (0.0, 0.0)
+        self.canvas_extent = (1.0, 1.0)
+        self.zoom_factor = 1.0
+        camera_count = load_dataset_camera_count(dataset)
+        self.dataset_camera_count = camera_count
+        self.camera_count_var = tk.IntVar(value=camera_count)
         self.selected: tuple[str, Object] | None = None
         self.selected_pair: int | None = None
         self._resize_job: str | None = None
@@ -369,35 +439,55 @@ class MatchEditor(tk.Tk):
         style.map("Treeview", background=[("selected", "#DDF4EF")], foreground=[("selected", INK)])
 
     def _build_ui(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
         header = ttk.Frame(self, style="Header.TFrame", height=68)
-        header.pack(fill="x")
-        header.pack_propagate(False)
+        header.grid(row=0, column=0, sticky="ew")
+        header.grid_propagate(False)
+        header.columnconfigure(0, weight=1)
         brand = ttk.Frame(header, style="Header.TFrame")
-        brand.pack(side="left", padx=22, pady=11)
+        brand.grid(row=0, column=0, sticky="w", padx=22, pady=11)
         ttk.Label(brand, text="MATCHROOM", style="Title.TLabel").pack(anchor="w")
         ttk.Label(brand, text="Review object pairs · regenerate trusted crops", style="Subtitle.TLabel").pack(anchor="w")
         self.header_file = ttk.Label(header, text="Select an image", style="Subtitle.TLabel")
-        self.header_file.pack(side="right", padx=24)
+        self.header_file.grid(row=0, column=1, sticky="e", padx=24)
 
-        body = ttk.Frame(self)
-        body.pack(fill="both", expand=True)
+        body = tk.PanedWindow(
+            self,
+            orient=tk.HORIZONTAL,
+            background=BG,
+            borderwidth=0,
+            sashwidth=7,
+            sashrelief="flat",
+            showhandle=False,
+        )
+        body.grid(row=1, column=0, sticky="nsew")
+        self.main_panes = body
         self._build_sidebar(body)
         self._build_workspace(body)
         self._build_inspector(body)
 
         footer = ttk.Frame(self, style="Panel.TFrame", height=48)
-        footer.pack(fill="x", side="bottom")
-        footer.pack_propagate(False)
+        footer.grid(row=2, column=0, sticky="ew")
+        footer.grid_propagate(False)
+        footer.columnconfigure(1, weight=1)
+        footer.rowconfigure(0, weight=1)
         self.status_dot = tk.Canvas(footer, width=20, height=20, bg=PANEL, highlightthickness=0)
-        self.status_dot.pack(side="left", padx=(20, 4))
+        self.status_dot.grid(row=0, column=0, padx=(20, 4))
         self.status_dot.create_oval(6, 6, 14, 14, fill=TEAL, outline="", tags="dot")
         self.status_text = ttk.Label(footer, text="Ready", style="Muted.TLabel")
-        self.status_text.pack(side="left")
-        ttk.Label(footer, text="Ctrl+S save  ·  Ctrl+Z undo  ·  Delete unpair", style="Muted.TLabel").pack(side="right", padx=20)
+        self.status_text.grid(row=0, column=1, sticky="w")
+        shortcut_label = ttk.Label(
+            footer,
+            text="Ctrl+S save  ·  Ctrl+Z undo  ·  Delete unpair",
+            style="Muted.TLabel",
+        )
+        shortcut_label.grid(row=0, column=2, sticky="e", padx=20)
 
-    def _build_sidebar(self, parent: ttk.Frame) -> None:
+    def _build_sidebar(self, parent: tk.PanedWindow) -> None:
         side = ttk.Frame(parent, style="Panel.TFrame", width=260)
-        side.pack(side="left", fill="y", padx=(0, 1))
+        parent.add(side, width=260, minsize=220, stretch="never")
         side.pack_propagate(False)
 
         dataset_panel = ttk.Frame(side, style="Panel.TFrame")
@@ -417,6 +507,21 @@ class MatchEditor(tk.Tk):
             justify="left",
         )
         self.dataset_label.pack(fill="x", padx=16, pady=(0, 8))
+
+        layout_panel = ttk.Frame(side, style="Panel.TFrame")
+        layout_panel.pack(fill="x", padx=16, pady=(0, 8))
+        ttk.Label(layout_panel, text="CAMERAS", style="Section.TLabel").pack(side="left")
+        self.camera_count_box = ttk.Combobox(
+            layout_panel,
+            textvariable=self.camera_count_var,
+            values=(2, 4),
+            state="readonly",
+            width=4,
+        )
+        self.camera_count_box.pack(side="right")
+        self.camera_count_box.bind(
+            "<<ComboboxSelected>>", self._camera_layout_changed
+        )
 
         title = ttk.Frame(side, style="Panel.TFrame")
         title.pack(fill="x", padx=16, pady=(5, 9))
@@ -450,24 +555,45 @@ class MatchEditor(tk.Tk):
         self.image_list.bind("<<ListboxSelect>>", self._queue_select)
         self._refresh_queue()
 
-    def _build_workspace(self, parent: ttk.Frame) -> None:
+    def _build_workspace(self, parent: tk.PanedWindow) -> None:
         workspace = ttk.Frame(parent)
-        workspace.pack(side="left", fill="both", expand=True, padx=14, pady=14)
+        parent.add(workspace, minsize=520, stretch="always", padx=14, pady=14)
         toolbar = ttk.Frame(workspace, style="Panel.TFrame")
         toolbar.pack(fill="x", pady=(0, 10))
-        ttk.Label(toolbar, text="MATCH CANVAS", style="Section.TLabel").pack(side="left", padx=14, pady=11)
-        self.summary_label = ttk.Label(toolbar, text="—", style="Muted.TLabel")
+        toolbar.columnconfigure(0, weight=1)
+        toolbar_info = ttk.Frame(toolbar, style="Panel.TFrame")
+        toolbar_info.grid(row=0, column=0, sticky="w", padx=(14, 4), pady=6)
+        ttk.Label(toolbar_info, text="MATCH CANVAS", style="Section.TLabel").pack(side="left")
+        self.summary_label = ttk.Label(toolbar_info, text="—", style="Muted.TLabel")
         self.summary_label.pack(side="left", padx=4)
-        ttk.Button(toolbar, text="↶ Undo", style="Quiet.TButton", command=self.undo).pack(side="right", padx=(2, 10), pady=6)
-        ttk.Button(toolbar, text="↷ Redo", style="Quiet.TButton", command=self.redo).pack(side="right", padx=2, pady=6)
-        ttk.Button(toolbar, text="Auto-match", style="Quiet.TButton", command=self.reset_automatic).pack(side="right", padx=2, pady=6)
+
+        toolbar_actions = ttk.Frame(toolbar, style="Panel.TFrame")
+        toolbar_actions.grid(row=0, column=1, sticky="e", padx=(4, 10), pady=6)
+        ttk.Button(toolbar_actions, text="↶ Undo", style="Quiet.TButton", command=self.undo).pack(side="left", padx=2)
+        ttk.Button(toolbar_actions, text="↷ Redo", style="Quiet.TButton", command=self.redo).pack(side="left", padx=2)
+        ttk.Button(toolbar_actions, text="Auto-match", style="Quiet.TButton", command=self.reset_automatic).pack(side="left", padx=2)
+        self.zoom_label = ttk.Label(toolbar_actions, text="100%", style="Muted.TLabel")
+        self.zoom_label.pack(side="left", padx=(8, 4))
+        ttk.Button(toolbar_actions, text="−", style="Quiet.TButton", command=lambda: self.zoom_by(0.8)).pack(side="left", padx=2)
+        ttk.Button(toolbar_actions, text="Fit", style="Quiet.TButton", command=self.reset_zoom).pack(side="left", padx=2)
+        ttk.Button(toolbar_actions, text="+", style="Quiet.TButton", command=lambda: self.zoom_by(1.25)).pack(side="left", padx=2)
 
         canvas_frame = ttk.Frame(workspace, style="Panel.TFrame")
         canvas_frame.pack(fill="both", expand=True)
+        canvas_frame.columnconfigure(0, weight=1)
+        canvas_frame.rowconfigure(0, weight=1)
         self.canvas = tk.Canvas(canvas_frame, bg=CANVAS_BG, highlightthickness=0, cursor="crosshair")
-        self.canvas.pack(fill="both", expand=True, padx=8, pady=8)
+        horizontal = ttk.Scrollbar(canvas_frame, orient="horizontal", command=self.canvas.xview)
+        vertical = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(xscrollcommand=horizontal.set, yscrollcommand=vertical.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=(8, 0))
+        vertical.grid(row=0, column=1, sticky="ns", pady=(8, 0))
+        horizontal.grid(row=1, column=0, sticky="ew", padx=(8, 0))
         self.canvas.bind("<Button-1>", self._canvas_click)
         self.canvas.bind("<Configure>", self._canvas_resized)
+        self.canvas.bind("<MouseWheel>", self._mouse_wheel_zoom)
+        self.canvas.bind("<Button-4>", lambda _: self.zoom_by(1.25))
+        self.canvas.bind("<Button-5>", lambda _: self.zoom_by(0.8))
         hint = ttk.Frame(workspace, style="Panel.TFrame")
         hint.pack(fill="x", pady=(10, 0))
         self.instruction = ttk.Label(
@@ -479,9 +605,9 @@ class MatchEditor(tk.Tk):
         self.intersection_badge = ttk.Label(hint, text="0 crossings", style="Muted.TLabel")
         self.intersection_badge.pack(side="right", padx=14)
 
-    def _build_inspector(self, parent: ttk.Frame) -> None:
+    def _build_inspector(self, parent: tk.PanedWindow) -> None:
         panel = ttk.Frame(parent, style="Panel.TFrame", width=340)
-        panel.pack(side="right", fill="y")
+        parent.add(panel, width=340, minsize=280, stretch="never")
         panel.pack_propagate(False)
         ttk.Label(panel, text="MATCH INSPECTOR", style="Section.TLabel").pack(anchor="w", padx=16, pady=(17, 3))
         self.selection_text = ttk.Label(
@@ -527,6 +653,60 @@ class MatchEditor(tk.Tk):
         self.bind_all("<Control-y>", lambda _: self.redo())
         self.bind_all("<Delete>", lambda _: self.unpair_selected())
         self.bind_all("<Escape>", lambda _: self._clear_selection())
+        self.bind_all("<Control-plus>", lambda _: self.zoom_by(1.25))
+        self.bind_all("<Control-equal>", lambda _: self.zoom_by(1.25))
+        self.bind_all("<Control-minus>", lambda _: self.zoom_by(0.8))
+        self.bind_all("<Control-0>", lambda _: self.reset_zoom())
+
+    def _camera_layout_changed(self, _event: tk.Event | None = None) -> None:
+        camera_count = int(self.camera_count_var.get())
+        if camera_count == self.dataset_camera_count:
+            return
+        previous = self.dataset_camera_count
+        if self.document and not self._confirm_leave():
+            self.camera_count_var.set(previous)
+            return
+        try:
+            save_dataset_camera_count(self.dataset, camera_count)
+        except OSError as exc:
+            self.camera_count_var.set(previous)
+            messagebox.showerror("Could not save dataset settings", str(exc), parent=self)
+            self._set_status("Camera layout could not be saved.", error=True)
+            return
+        self.dataset_camera_count = camera_count
+        if not self.document:
+            self._set_status(f"{camera_count}-camera layout selected and saved.")
+            return
+        image_path = self.document.image_path
+        self.document = None
+        self.selected = None
+        self.selected_pair = None
+        self.open_image(image_path)
+
+    def _mouse_wheel_zoom(self, event: tk.Event) -> str:
+        self.zoom_by(1.25 if event.delta > 0 else 0.8)
+        return "break"
+
+    def reset_zoom(self) -> None:
+        self.zoom_by(1.0, absolute=True)
+
+    def zoom_by(self, factor: float, *, absolute: bool = False) -> None:
+        if not self.document:
+            return
+        viewport_center = (
+            self.canvas.canvasx(self.canvas.winfo_width() / 2),
+            self.canvas.canvasy(self.canvas.winfo_height() / 2),
+        )
+        source_center = self._source(*viewport_center)
+        target = factor if absolute else self.zoom_factor * factor
+        self.zoom_factor = min(8.0, max(0.25, target))
+        self._redraw()
+        target_x, target_y = self._screen(*source_center)
+        extent_w, extent_h = self.canvas_extent
+        view_w = self.canvas.winfo_width()
+        view_h = self.canvas.winfo_height()
+        self.canvas.xview_moveto(max(0.0, (target_x - view_w / 2) / extent_w))
+        self.canvas.yview_moveto(max(0.0, (target_y - view_h / 2) / extent_h))
 
     def browse_dataset(self) -> None:
         selected = filedialog.askdirectory(
@@ -560,7 +740,19 @@ class MatchEditor(tk.Tk):
         if not self._confirm_leave():
             return
 
+        try:
+            camera_count = load_dataset_camera_count(dataset)
+        except OSError as exc:
+            messagebox.showerror(
+                "Could not load dataset settings",
+                f"The camera layout metadata could not be read or created:\n\n{exc}",
+                parent=self,
+            )
+            return
+
         self.dataset = dataset
+        self.dataset_camera_count = camera_count
+        self.camera_count_var.set(camera_count)
         self.output_dir = dataset / "matches"
         self.paths = list(image_files(dataset, None))
         self.document = None
@@ -633,7 +825,12 @@ class MatchEditor(tk.Tk):
         self._set_status(f"Loading {path.name}…")
         self.update_idletasks()
         try:
-            document = MatchDocument(self.dataset, path, self.merge_iou)
+            document = MatchDocument(
+                self.dataset,
+                path,
+                self.merge_iou,
+                int(self.camera_count_var.get()),
+            )
             width, height, rows = read_bmp_rows(path)
         except Exception as exc:
             messagebox.showerror("Could not open image", str(exc), parent=self)
@@ -642,11 +839,22 @@ class MatchEditor(tk.Tk):
         self.document = document
         self.rows = rows
         self.source_size = (width, height)
+        self.zoom_factor = 1.0
         self.selected = None
         self.selected_pair = None
         self.header_file.configure(text=path.name)
         self._redraw()
-        self._set_status("Ready to review. Click one object in each camera to pair them.")
+        if document.camera_count == 4:
+            self.instruction.configure(
+                text="Select an object in a top quadrant, then its partner directly below."
+            )
+        else:
+            self.instruction.configure(
+                text="Select an object in either camera, then select its partner."
+            )
+        self._set_status(
+            f"Ready to review in {document.camera_count}-camera mode."
+        )
 
     def _canvas_resized(self, _event: tk.Event) -> None:
         if self._resize_job:
@@ -667,21 +875,64 @@ class MatchEditor(tk.Tk):
             )
             return
         margin = 26
-        max_width = max(100, self.canvas.winfo_width() - margin * 2)
-        max_height = max(100, self.canvas.winfo_height() - margin * 2)
+        viewport_width = max(100, self.canvas.winfo_width())
+        viewport_height = max(100, self.canvas.winfo_height())
+        max_width = max(100, viewport_width - margin * 2)
+        max_height = max(100, viewport_height - margin * 2)
+        fit_scale = min(
+            max_width / max(document.width, 1),
+            max_height / max(document.height, 1),
+            1.0,
+        )
+        requested_scale = fit_scale * self.zoom_factor
         self.photo, self.image_scale = scaled_photo(
-            self.rows, document.width, document.height, max_width, max_height
+            self.rows,
+            document.width,
+            document.height,
+            max(1, int(document.width * requested_scale)),
+            max(1, int(document.height * requested_scale)),
+            max_scale=requested_scale,
         )
         draw_w = int(document.width * self.image_scale)
         draw_h = int(document.height * self.image_scale)
-        origin_x = (self.canvas.winfo_width() - draw_w) / 2
-        origin_y = (self.canvas.winfo_height() - draw_h) / 2
+        origin_x = (
+            (viewport_width - draw_w) / 2
+            if draw_w + margin * 2 <= viewport_width
+            else margin
+        )
+        origin_y = (
+            (viewport_height - draw_h) / 2
+            if draw_h + margin * 2 <= viewport_height
+            else margin
+        )
         self.image_origin = (origin_x, origin_y)
+        self.canvas_extent = (
+            max(float(viewport_width), draw_w + margin * 2.0),
+            max(float(viewport_height), draw_h + margin * 2.0),
+        )
+        self.canvas.configure(
+            scrollregion=(0, 0, self.canvas_extent[0], self.canvas_extent[1])
+        )
+        self.zoom_label.configure(text=f"{round(self.zoom_factor * 100)}%")
         self.canvas.create_image(origin_x, origin_y, image=self.photo, anchor="nw")
         split_y = origin_y + document.height / 2 * self.image_scale
         self.canvas.create_line(origin_x, split_y, origin_x + draw_w, split_y, fill="#FFFFFF", stipple="gray50", width=1)
-        self.canvas.create_text(origin_x + 10, origin_y + 10, text="TOP CAMERA", fill="white", anchor="nw", font=("Segoe UI Semibold", 9))
-        self.canvas.create_text(origin_x + 10, split_y + 10, text="BOTTOM CAMERA", fill="white", anchor="nw", font=("Segoe UI Semibold", 9))
+        if document.camera_count == 4:
+            split_x = origin_x + document.width / 2 * self.image_scale
+            self.canvas.create_line(split_x, origin_y, split_x, origin_y + draw_h, fill="#FFFFFF", stipple="gray50", width=1)
+            labels = (
+                (origin_x + 10, origin_y + 10, "TOP LEFT"),
+                (split_x + 10, origin_y + 10, "TOP RIGHT"),
+                (origin_x + 10, split_y + 10, "BOTTOM LEFT"),
+                (split_x + 10, split_y + 10, "BOTTOM RIGHT"),
+            )
+        else:
+            labels = (
+                (origin_x + 10, origin_y + 10, "TOP CAMERA"),
+                (origin_x + 10, split_y + 10, "BOTTOM CAMERA"),
+            )
+        for label_x, label_y, label in labels:
+            self.canvas.create_text(label_x, label_y, text=label, fill="white", anchor="nw", font=("Segoe UI Semibold", 9))
         for index, (top, bottom) in enumerate(document.pairs):
             color = HEX_COLORS[index % len(HEX_COLORS)]
             x1, y1 = self._screen(top.center_x, top.center_y)
@@ -723,7 +974,7 @@ class MatchEditor(tk.Tk):
     def _hit_object(self, x: float, y: float) -> tuple[str, Object] | None:
         if not self.document:
             return None
-        sx, sy = self._source(x, y)
+        sx, sy = self._source(self.canvas.canvasx(x), self.canvas.canvasy(y))
         side = "top" if sy < self.document.height / 2 else "bottom"
         objects = self.document.top if side == "top" else self.document.bottom
         inside = [item for item in objects if item.bbox[0] - 8 <= sx <= item.bbox[2] + 8 and item.bbox[1] - 8 <= sy <= item.bbox[3] + 8]
@@ -755,6 +1006,16 @@ class MatchEditor(tk.Tk):
         first_side, first_item = self.selected
         top = first_item if first_side == "top" else item
         bottom = item if side == "bottom" else first_item
+        if not self.document.same_column(top, bottom):
+            self.instruction.configure(
+                text=(
+                    "Four-camera mode keeps columns separate: choose a partner "
+                    "directly above or below in the same column."
+                )
+            )
+            self._set_status("Cross-column pairing is not allowed.", warning=True)
+            self._redraw()
+            return
         changed = self.document.pair(top, bottom)
         self.selected = None
         self.selected_pair = next(
@@ -851,7 +1112,11 @@ class MatchEditor(tk.Tk):
     def _clear_selection(self) -> None:
         self.selected = None
         self.selected_pair = None
-        self.instruction.configure(text="Select an object in either camera, then select its partner.")
+        if self.document and self.document.camera_count == 4:
+            text = "Select an object in a top quadrant, then its partner directly below."
+        else:
+            text = "Select an object in either camera, then select its partner."
+        self.instruction.configure(text=text)
         self._redraw()
 
     def unpair_selected(self) -> None:

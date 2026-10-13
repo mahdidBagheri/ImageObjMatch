@@ -506,6 +506,32 @@ def transform_guided_match(
     return sorted(pairs, key=lambda pair: (pair[0].center_x, pair[0].center_y))
 
 
+def camera_layout_match(
+    top: Sequence[Object],
+    bottom: Sequence[Object],
+    width: int,
+    transform: LinearTransform | None,
+    camera_count: int = 2,
+) -> list[tuple[Object, Object]]:
+    """Match top-to-bottom objects while respecting the camera layout."""
+    if camera_count == 2:
+        return transform_guided_match(top, bottom, width, transform)
+    if camera_count != 4:
+        raise ValueError("camera_count must be 2 or 4")
+
+    split_x = width / 2.0
+    pairs: list[tuple[Object, Object]] = []
+    for is_right in (False, True):
+        top_column = [item for item in top if (item.center_x >= split_x) == is_right]
+        bottom_column = [
+            item for item in bottom if (item.center_x >= split_x) == is_right
+        ]
+        pairs.extend(
+            transform_guided_match(top_column, bottom_column, width, transform)
+        )
+    return sorted(pairs, key=lambda pair: (pair[0].center_x, pair[0].center_y))
+
+
 def object_json(item: Object) -> dict:
     result = asdict(item)
     result["bbox"] = list(item.bbox)

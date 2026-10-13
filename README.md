@@ -19,6 +19,13 @@ For each image, annotations with the same base filename are loaded from every
 `_...` folder and overlapping outlines are aggregated using the merge-IoU
 threshold. The visual editor's **Browse…** button selects this data root.
 
+In the visual editor, select either a two-camera layout (top and bottom) or a
+four-camera layout. Four-camera images are split at both midpoints, and matches
+are constrained to top-left↔bottom-left and top-right↔bottom-right. The canvas
+supports button, mouse-wheel, and keyboard zoom with scrollbars for navigation.
+The selection is stored per data root in `match_editor.metadata.json`. Missing
+or invalid metadata is initialized and saved as a two-camera layout.
+
 `match_objects.py` merges duplicate LabelMe outlines across all `_...`
 annotation folders (annotation labels are ignored), divides each composite
 image at half its height, and maps objects from the top camera to objects from
